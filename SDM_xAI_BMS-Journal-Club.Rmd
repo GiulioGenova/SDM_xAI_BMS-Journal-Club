@@ -1,0 +1,555 @@
+---
+title: "Explainable AI in Species Distribution Modelling "
+subtitle: "Example code from Ryo et al., 2021"
+author: "Giulio Genova - giulio.genova@eurac.edu"
+institute: "Eurac Research - Instite for Alpine Environment"
+date: "2021/06/01"
+output:
+  html_document:
+    toc: true
+    theme: united
+---
+
+# Source
+
+This is the example script (partly modified) described in ["Explainable artificial intelligence enhances the ecological interpretability of black-box species distribution models"](https://doi.org/10.1111/ecog.05360) by Ryo et al.
+The original code can be found [here](https://doi.org/10.5281/zenodo.4048271) 
+
+The data species occurrence and climate data are taken form here: https://www.gbif.org/
+using the {sdmbench} R package
+
+# Software (R packages)
+```{r layout_setup, echo=FALSE, include=FALSE}
+knitr::opts_chunk$set(
+fig.pos = "!h", 
+out.extra = "",
+fig.align = "left", out.width = '100%',
+echo=FALSE,warning=FALSE, message = FALSE,
+cache=FALSE)
+```
+
+```{r setup, echo=TRUE}
+library(sf)
+library(mapview)
+library(sp)
+library(maptools)
+library(sdmbench)
+library(mlr)
+library(iml)
+library(lime)
+library(dplyr)
+library(ggplot2)
+library(rsample)
+library(withr)
+library(RStoolbox)
+library(DT)
+dictionary = read.csv("worldclim_dictionary.csv")
+```
+
+
+
+# Species {.tabset .tabset-fade}
+
+## Campanula Morettiana 
+
+Rare species, lives on calcareous rocks. 
+Meso and microclimate as well as topography play a crucial role in driving its presence.
+
+<img width=20% height=20% src="campanula_1.jpeg">
+<img width=20% height=20% src="campanula_2.jpeg">
+<img width=20% height=20% src="campanula_3.jpeg">
+
+
+
+### Get data
+
+
+
+```{r echo=TRUE,include=TRUE}
+species = "Campanula morettiana"
+climate_resolution = 2.5
+# Get and prepare data ----------------------------------------------------
+set.seed(42)
+
+# this function downloads and stores the data, and to make the rest of the script reproducible (GBIF data can be updated with new observations) we are loading a stored static dataset
+occ_data_raw <-
+get_benchmarking_data(species, limit = 1000,climate_resolution = climate_resolution)
+
+
+colnames(occ_data_raw$df_data) = c(dictionary$Abbreviation,"label")
+names(occ_data_raw$raster_data$climate_variables) <- dictionary$Abbreviation
+
+occ_data <- occ_data_raw$df_data
+
+occ_data$label <- as.factor(occ_data$label)
+
+coordinates_df <- rbind(occ_data_raw$raster_data$coords_presence, occ_data_raw$raster_data$background)
+
+occ_data <- normalizeFeatures(occ_data, method = "standardize")
+
+occ_data <- cbind(occ_data, coordinates_df)
+occ_data <- na.omit(occ_data)
+
+occ_sf <- st_as_sf(occ_data,coords = c("x", "y"), crs = 4326, agr = "constant")
+```
+
+### View presence
+
+```{r echo=TRUE}
+occ_sf = occ_sf %>% filter(label == 1)
+mapview()+mapview(occ_sf,zcol = "label")
+```
+
+### Split data for machine learning
+
+```{r echo=TRUE}
+set.seed(42)
+train_test_split <- initial_split(occ_data, prop = 0.7)
+data_train <- training(train_test_split)
+data_test  <- testing(train_test_split)
+data_train$x <- NULL
+data_train$y <- NULL
+data_test_subset <- data_test %>% filter(label == 1)
+```
+
+### Train model
+Show performance and variable importance
+```{r echo=TRUE}
+task <-
+  makeClassifTask(id = "model", data = data_train, target = "label")
+lrn <- makeLearner("classif.randomForest", predict.type = "prob")
+mod <- train(lrn, task)
+pred <- predict(mod, newdata=data_test)
+VIMP <- as.data.frame(getFeatureImportance(mod)$res)
+
+# Top n important variables
+top_n(VIMP, n=5, importance) %>%
+  ggplot(., aes(x=reorder(variable,importance), y=importance))+
+  geom_bar(stat='identity')+ coord_flip() + xlab("")
+
+# Performance
+performance(pred, measures=auc)
+```
+
+### ALE Feature effect
+Accumulated local effects and partial dependence plots both show the average model prediction over the feature. The difference is that ALE are computed as accumulated differences over the conditional distribution and partial dependence plots over the marginal distribution. ALE plots preferable to PDPs, because they are faster and unbiased when features are correlated.
+
+ALE plots for categorical features are automatically ordered by the similarity of the categories based on the distribution of the other features for instances in a category. When the feature is an ordered factor, the ALE plot leaves the order as is.
+```{r echo=TRUE}
+
+predictor <-
+  Predictor$new(mod, data = data_train, class = 1, y = "label")
+ale <- FeatureEffect$new(predictor, feature = "Temp_seasonality")
+ale$plot() +
+  theme_minimal() +
+  ggtitle("ALE Feature Effect") +
+  xlab("Temperature seasonality")
+
+predictor <-
+  Predictor$new(mod, data = data_train, class = 1, y = "label")
+ale <- FeatureEffect$new(predictor, feature = "Annual_precip")
+ale$plot() +
+  theme_minimal() +
+  ggtitle("ALE Feature Effect") +
+  xlab("Annual precipitation")
+```
+
+
+### Generate explanations
+
+Once an explainer has been created using the lime() function it can be used to explain the result of the model on new observations. The explain() function takes new observation along with the explainer and returns a data.frame with prediction explanations, one observation per row. The returned explanations can then be visualised in a number of ways, e.g. with plot_features()
+
+We select three predictions at random
+```{r echo=TRUE, fig.height=7}
+# resampling
+sample_data <- withr::with_seed(10, sample_n(data_test_subset, 3))
+sample_data_coords <- dplyr::select(sample_data, c("x", "y"))
+sample_data$x <- NULL
+sample_data$y <- NULL
+
+
+set.seed(42)
+explainer <- lime(data_train, mod)
+set.seed(42)
+explanation <-
+  lime::explain(sample_data,
+                explainer,
+                n_labels = 1,
+                n_features = 5)
+plot_features(explanation,ncol = 1)+xlab(NULL)
+```
+
+### Plot predicitons
+```{r echo=TRUE}
+customPredictFun <- function(model, data) {
+  v <- predict(model, data, type = "prob")
+  v <- as.data.frame(v)
+  colnames(v) <- c("absence", "presence")
+  return(v$presence)
+}
+
+normalized_raster <- RStoolbox::normImage(occ_data_raw$raster_data$climate_variables)
+
+pr <-
+  dismo::predict(normalized_raster,
+                 mlr::getLearnerModel(mod, TRUE),
+                 fun = customPredictFun)
+
+
+coordinates(sample_data_coords) <- ~ x + y
+
+sl1 <- list("sp.points", sample_data_coords, pch=1, cex=1.2, lwd=2, col="white")
+sl2 <- list("sp.pointLabel", sample_data_coords, 
+            label=c("Case 1","Case 2","Case 3"),
+            cex=0.9, col="white", fontface=2)
+
+rf_map <-
+  spplot(pr, main = "Habitat Suitability Map",
+         scales = list(draw = TRUE),
+         sp.layout = list(sl1,sl2),
+         labels=TRUE
+  )
+
+rf_map
+```
+
+## Miramella alpina
+
+An example of an alpine Grasshopper
+
+<img width=20% height=20% src="miramella_1.jpg">
+<img width=20% height=20% src="miramella_2.jpg">
+<img width=20% height=20% src="miramella_3.jpg">
+
+### Get data
+
+For the next species we will only change the following lines of code:
+
+```{r echo=TRUE}
+species = "Miramella alpina"
+climate_resolution = 10
+```
+
+```{r echo=FALSE,include=FALSE}
+species = "Miramella alpina"
+climate_resolution = 10
+# Get and prepare data ----------------------------------------------------
+set.seed(42)
+
+# this function downloads and stores the data, and to make the rest of the script reproducible (GBIF data can be updated with new observations) we are loading a stored static dataset
+occ_data_raw <-
+get_benchmarking_data(species, limit = 1000,climate_resolution = climate_resolution)
+
+
+colnames(occ_data_raw$df_data) = c(dictionary$Abbreviation,"label")
+names(occ_data_raw$raster_data$climate_variables) <- dictionary$Abbreviation
+
+occ_data <- occ_data_raw$df_data
+
+occ_data$label <- as.factor(occ_data$label)
+
+coordinates_df <- rbind(occ_data_raw$raster_data$coords_presence, occ_data_raw$raster_data$background)
+
+occ_data <- normalizeFeatures(occ_data, method = "standardize")
+
+occ_data <- cbind(occ_data, coordinates_df)
+occ_data <- na.omit(occ_data)
+
+occ_sf <- st_as_sf(occ_data,coords = c("x", "y"), crs = 4326, agr = "constant")
+```
+
+### View presence
+
+```{r echo=FALSE}
+occ_sf = occ_sf %>% filter(label == 1)
+mapview()+mapview(occ_sf,zcol = "label")
+```
+
+### Split data for machine learning
+
+```{r echo=FALSE}
+set.seed(42)
+train_test_split <- initial_split(occ_data, prop = 0.7)
+data_train <- training(train_test_split)
+data_test  <- testing(train_test_split)
+data_train$x <- NULL
+data_train$y <- NULL
+data_test_subset <- data_test %>% filter(label == 1)
+```
+
+### Train model
+Show performance and variable importance
+```{r echo=FALSE}
+task <-
+  makeClassifTask(id = "model", data = data_train, target = "label")
+lrn <- makeLearner("classif.randomForest", predict.type = "prob")
+mod <- train(lrn, task)
+pred <- predict(mod, newdata=data_test)
+VIMP <- as.data.frame(getFeatureImportance(mod)$res)
+
+# Top n important variables
+top_n(VIMP, n=5, importance) %>%
+  ggplot(., aes(x=reorder(variable,importance), y=importance))+
+  geom_bar(stat='identity')+ coord_flip() + xlab("")
+
+# Performance
+performance(pred, measures=auc)
+```
+
+### ALE Feature effect
+Accumulated local effects and partial dependence plots both show the average model prediction over the feature. The difference is that ALE are computed as accumulated differences over the conditional distribution and partial dependence plots over the marginal distribution. ALE plots preferable to PDPs, because they are faster and unbiased when features are correlated.
+
+ALE plots for categorical features are automatically ordered by the similarity of the categories based on the distribution of the other features for instances in a category. When the feature is an ordered factor, the ALE plot leaves the order as is.
+```{r echo=FALSE}
+
+predictor <-
+  Predictor$new(mod, data = data_train, class = 1, y = "label")
+ale <- FeatureEffect$new(predictor, feature = "Temp_seasonality")
+ale$plot() +
+  theme_minimal() +
+  ggtitle("ALE Feature Effect") +
+  xlab("Temperature seasonality")
+
+predictor <-
+  Predictor$new(mod, data = data_train, class = 1, y = "label")
+ale <- FeatureEffect$new(predictor, feature = "Annual_precip")
+ale$plot() +
+  theme_minimal() +
+  ggtitle("ALE Feature Effect") +
+  xlab("Annual precipitation")
+```
+
+
+### Generate explanations
+
+Once an explainer has been created using the lime() function it can be used to explain the result of the model on new observations. The explain() function takes new observation along with the explainer and returns a data.frame with prediction explanations, one observation per row. The returned explanations can then be visualised in a number of ways, e.g. with plot_features()
+
+We select three predictions at random
+```{r echo=FALSE, fig.height=7}
+# resampling
+sample_data <- withr::with_seed(10, sample_n(data_test_subset, 3))
+sample_data_coords <- dplyr::select(sample_data, c("x", "y"))
+sample_data$x <- NULL
+sample_data$y <- NULL
+
+
+set.seed(42)
+explainer <- lime(data_train, mod)
+set.seed(42)
+explanation <-
+  lime::explain(sample_data,
+                explainer,
+                n_labels = 1,
+                n_features = 5)
+plot_features(explanation,ncol = 1)+xlab(NULL)
+```
+
+### Plot predicitons
+
+```{r echo=FALSE}
+customPredictFun <- function(model, data) {
+  v <- predict(model, data, type = "prob")
+  v <- as.data.frame(v)
+  colnames(v) <- c("absence", "presence")
+  return(v$presence)
+}
+
+normalized_raster <- RStoolbox::normImage(occ_data_raw$raster_data$climate_variables)
+
+pr <-
+  dismo::predict(normalized_raster,
+                 mlr::getLearnerModel(mod, TRUE),
+                 fun = customPredictFun)
+
+
+coordinates(sample_data_coords) <- ~ x + y
+
+sl1 <- list("sp.points", sample_data_coords, pch=1, cex=1.2, lwd=2, col="white")
+sl2 <- list("sp.pointLabel", sample_data_coords, 
+            label=c("Case 1","Case 2","Case 3"),
+            cex=0.9, col="white", fontface=2)
+
+rf_map <-
+  spplot(pr, main = "Habitat Suitability Map",
+         scales = list(draw = TRUE),
+         sp.layout = list(sl1,sl2),
+         labels=TRUE
+  )
+
+rf_map
+```
+
+## Asparagus acutifolius
+
+A mediterranean plant species
+
+<img width=20% height=20% src="asparagus_1.jpg">
+<img width=20% height=20% src="asparagus_2.jpg">
+<img width=20% height=20% src="asparagus_3.jpg">
+
+
+
+### Get data
+
+For the next species we will only change the following lines of code:
+
+```{r echo=TRUE}
+species = "Asparagus acutifolius"
+climate_resolution = 10
+```
+
+
+```{r echo=FALSE,include=FALSE}
+species = "Asparagus acutifolius"
+climate_resolution = 10
+# Get and prepare data ----------------------------------------------------
+set.seed(42)
+
+# this function downloads and stores the data, and to make the rest of the script reproducible (GBIF data can be updated with new observations) we are loading a stored static dataset
+occ_data_raw <-
+get_benchmarking_data(species, limit = 1000,climate_resolution = climate_resolution)
+
+
+colnames(occ_data_raw$df_data) = c(dictionary$Abbreviation,"label")
+names(occ_data_raw$raster_data$climate_variables) <- dictionary$Abbreviation
+
+occ_data <- occ_data_raw$df_data
+
+occ_data$label <- as.factor(occ_data$label)
+
+coordinates_df <- rbind(occ_data_raw$raster_data$coords_presence, occ_data_raw$raster_data$background)
+
+occ_data <- normalizeFeatures(occ_data, method = "standardize")
+
+occ_data <- cbind(occ_data, coordinates_df)
+occ_data <- na.omit(occ_data)
+
+occ_sf <- st_as_sf(occ_data,coords = c("x", "y"), crs = 4326, agr = "constant")
+```
+
+### View presence
+
+```{r echo=FALSE}
+occ_sf = occ_sf %>% filter(label == 1)
+mapview()+mapview(occ_sf,zcol = "label")
+```
+
+### Split data for machine learning
+
+```{r echo=FALSE}
+set.seed(42)
+train_test_split <- initial_split(occ_data, prop = 0.7)
+data_train <- training(train_test_split)
+data_test  <- testing(train_test_split)
+data_train$x <- NULL
+data_train$y <- NULL
+data_test_subset <- data_test %>% filter(label == 1)
+```
+
+### Train model
+Show performance and variable importance
+```{r echo=FALSE}
+task <-
+  makeClassifTask(id = "model", data = data_train, target = "label")
+lrn <- makeLearner("classif.randomForest", predict.type = "prob")
+mod <- train(lrn, task)
+pred <- predict(mod, newdata=data_test)
+VIMP <- as.data.frame(getFeatureImportance(mod)$res)
+
+# Top n important variables
+top_n(VIMP, n=5, importance) %>%
+  ggplot(., aes(x=reorder(variable,importance), y=importance))+
+  geom_bar(stat='identity')+ coord_flip() + xlab("")
+
+# Performance
+performance(pred, measures=auc)
+```
+
+### ALE Feature effect
+Accumulated local effects and partial dependence plots both show the average model prediction over the feature. The difference is that ALE are computed as accumulated differences over the conditional distribution and partial dependence plots over the marginal distribution. ALE plots preferable to PDPs, because they are faster and unbiased when features are correlated.
+
+ALE plots for categorical features are automatically ordered by the similarity of the categories based on the distribution of the other features for instances in a category. When the feature is an ordered factor, the ALE plot leaves the order as is.
+```{r echo=FALSE}
+
+predictor <-
+  Predictor$new(mod, data = data_train, class = 1, y = "label")
+ale <- FeatureEffect$new(predictor, feature = "Temp_seasonality")
+ale$plot() +
+  theme_minimal() +
+  ggtitle("ALE Feature Effect") +
+  xlab("Temperature seasonality")
+
+predictor <-
+  Predictor$new(mod, data = data_train, class = 1, y = "label")
+ale <- FeatureEffect$new(predictor, feature = "Annual_precip")
+ale$plot() +
+  theme_minimal() +
+  ggtitle("ALE Feature Effect") +
+  xlab("Annual precipitation")
+```
+
+
+### Generate explanations
+
+Once an explainer has been created using the lime() function it can be used to explain the result of the model on new observations. The explain() function takes new observation along with the explainer and returns a data.frame with prediction explanations, one observation per row. The returned explanations can then be visualised in a number of ways, e.g. with plot_features()
+
+We select three predictions at random
+```{r echo=FALSE, fig.height=7}
+# resampling
+sample_data <- withr::with_seed(10, sample_n(data_test_subset, 3))
+sample_data_coords <- dplyr::select(sample_data, c("x", "y"))
+sample_data$x <- NULL
+sample_data$y <- NULL
+
+
+set.seed(42)
+explainer <- lime(data_train, mod)
+set.seed(42)
+explanation <-
+  lime::explain(sample_data,
+                explainer,
+                n_labels = 1,
+                n_features = 5)
+plot_features(explanation,ncol = 1)+xlab(NULL)
+```
+
+### Plot predicitons
+
+```{r echo=FALSE}
+customPredictFun <- function(model, data) {
+  v <- predict(model, data, type = "prob")
+  v <- as.data.frame(v)
+  colnames(v) <- c("absence", "presence")
+  return(v$presence)
+}
+
+normalized_raster <- RStoolbox::normImage(occ_data_raw$raster_data$climate_variables)
+
+pr <-
+  dismo::predict(normalized_raster,
+                 mlr::getLearnerModel(mod, TRUE),
+                 fun = customPredictFun)
+
+
+coordinates(sample_data_coords) <- ~ x + y
+
+sl1 <- list("sp.points", sample_data_coords, pch=1, cex=1.2, lwd=2, col="white")
+sl2 <- list("sp.pointLabel", sample_data_coords, 
+            label=c("Case 1","Case 2","Case 3"),
+            cex=0.9, col="white", fontface=2)
+
+rf_map <-
+  spplot(pr, main = "Habitat Suitability Map",
+         scales = list(draw = TRUE),
+         sp.layout = list(sl1,sl2),
+         labels=TRUE
+  )
+
+rf_map
+```
+
+# Climatic data dictionary
+
+```{r echo=TRUE}
+DT::datatable(dictionary,rownames = FALSE)
+```
