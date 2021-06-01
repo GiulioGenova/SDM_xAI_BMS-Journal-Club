@@ -15,8 +15,8 @@ output:
 This is the example script (partly modified) described in ["Explainable artificial intelligence enhances the ecological interpretability of black-box species distribution models"](https://doi.org/10.1111/ecog.05360) by Ryo et al.
 The original code can be found [here](https://doi.org/10.5281/zenodo.4048271) 
 
-The data species occurrence and climate data are taken form here: https://www.gbif.org/
-using the {sdmbench} R package
+The data species occurrence and climate data is taken form here: https://www.gbif.org/
+using the {[sdmbench](https://github.com/boyanangelov/sdmbench)} R package
 
 # Software (R packages)
 ```{r layout_setup, echo=FALSE, include=FALSE}
